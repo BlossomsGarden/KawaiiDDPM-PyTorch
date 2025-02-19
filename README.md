@@ -9,14 +9,20 @@
 # 🔧 准备工作
 
 数据集 (Kaggle是神)
-- [Anime Faces](https://www.kaggle.com/datasets/soumikrakshit/anime-faces) 21551 张.
-- [Anime Face Dataset](https://www.kaggle.com/datasets/splcher/animefacedataset/data) 63632 张.
+- [Anime Faces](https://www.kaggle.com/datasets/soumikrakshit/anime-faces) 21551 张，64*64 像素
+- [Anime Face Dataset](https://www.kaggle.com/datasets/splcher/animefacedataset/data) 63632 张，正方形，大小不统一
 
 论文
 - [Denoising Diffusion Probabilistic Models](https://dl.acm.org/doi/abs/10.5555/3495724.3496298)
 
-官方源码 (tensorflow)
-- [diffusion_tf](https://github.com/hojonathanho/diffusion)
+源码
+- [官方 diffusion_tf](https://github.com/hojonathanho/diffusion)
+- [民间 diffusion_torch](https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/diffusion/ddpm)
+
+解说
+- 模型架构（视频） 刚刚重新回去看，发现视频已经被删了qwq
+- [模型架构（文字）](https://zhuanlan.zhihu.com/p/637815071)
+- [源码解读](https://zhuanlan.zhihu.com/p/655568910)
 
 
 ![{G}ZM $CJ356CFDCI~VB0LF](https://github.com/user-attachments/assets/f791ff38-32b9-4abb-8f35-fea3d69a2e16)
