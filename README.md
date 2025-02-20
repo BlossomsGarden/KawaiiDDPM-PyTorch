@@ -13,18 +13,36 @@
 - [Anime Face Dataset](https://www.kaggle.com/datasets/splcher/animefacedataset/data) 63632 张，正方形，大小不统一
 
 论文
-- [Denoising Diffusion Probabilistic Models](https://dl.acm.org/doi/abs/10.5555/3495724.3496298)
+- [Denoising Diffusion Probabilistic Models](https://dl.acm.org/doi/abs/10.5555/3495724.3496298) (2020)
+- [Attention is All You Need](https://dl.acm.org/doi/10.5555/3295222.3295349) (2017)
 
 源码
 - [官方 diffusion_tf](https://github.com/hojonathanho/diffusion)
 - [民间 diffusion_torch](https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/diffusion/ddpm)
 
 解说
-- 模型架构（视频） 刚刚重新回去看，发现视频已经被删了qwq
-- [模型架构（文字）](https://zhuanlan.zhihu.com/p/637815071)
-- [源码解读](https://zhuanlan.zhihu.com/p/655568910)
+- [模型架构（文章）](https://zhuanlan.zhihu.com/p/637815071)
+- [源码解读（文章）](https://zhuanlan.zhihu.com/p/655568910)
 
 
-![{G}ZM $CJ356CFDCI~VB0LF](https://github.com/user-attachments/assets/f791ff38-32b9-4abb-8f35-fea3d69a2e16)
+
+
+![Bad Deepseek](https://github.com/user-attachments/assets/f791ff38-32b9-4abb-8f35-fea3d69a2e16)
+
+
+# 👨‍💻 Attention 模块
+
+DDPM 论文给出的源码中注意力机制非必须，而且实现方式与擎天柱(Transformer)一样。学习路径（视频）如下，但感觉还是太抽象了，用数据预测的例子很好理解，即能让预测值更接近样本的空间分布状况，但你要是放在 LLM 或者 DDPM 里，脑子一下子迁移不过来
+
+- [学术性介绍](https://www.bilibili.com/video/BV1TZ421j7Ke)
+- [通俗易懂介绍](https://www.bilibili.com/video/BV1dt4y1J7ov) （注意评论区置顶）
+- [沐神介绍与简单代码](https://www.bilibili.com/video/BV1264y1i7R1) 
+
+
+
+# 💿 DDPM·Unet 架构
+
+以[知乎@猛猿]()大佬的解说图为基础，修改了原图的位置、做出了新的标注，使得本仓库中 main.py 文件中的 模型相关类、图像通道数 等信息都可以在图中找到对应，方便理解
+![Unet](./unet.png)
 
 # 💡 敬请期待...

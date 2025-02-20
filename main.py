@@ -90,7 +90,7 @@ class ResidualBlock(nn.Module):
             nn.GroupNorm(32, in_channels),
             lambda x: x * torch.sigmoid(x),  # 即Swish()，一种平滑的非线性激活函数，增强非线性表达能力
             nn.Dropout(0.5),
-            nn.Conv2d(in_channels, out_channels, kernel_size=(3, 3), padding=1)
+            nn.Conv2d(out_channels, out_channels, kernel_size=(3, 3), padding=1)
         )
 
         # 残差处理器
@@ -113,6 +113,106 @@ class ResidualBlock(nn.Module):
         return x2 + self.shortcut(x)
 
 
+# Attention
+# 与Transformer中的multi-head attention原理及实现方式一致（多头机制使模型可以并行关注不同模式的信息（如形状、颜色、纹理）增强表达能力）
+#
+# 作用：
+# 1、捕捉全局依赖：传统卷积层受限于局部感受野，而注意力机制可以建模图像中任意两个像素的关系，帮助模型理解全局结构（如对称性、物体间关系）
+# 2、增强去噪能力：在扩散模型的去噪过程中，某些区域的噪声可能与其他区域相关（如边缘、纹理连续性）。注意力机制通过加权聚合信息，帮助模型更准确地预测噪声。
+# 3、动态调整权重：不同时间步（扩散阶段）可能需要不同的关注模式。注意力机制允许模型自适应地调整权重，适应不同噪声水平下的生成需求。
+class AttentionBlock(nn.Module):
+    # channels：输入特征图的通道数
+    # n_heads：注意力头的数量（默认为1）
+    # d_k：每个注意力头的向量维度（默认为n_channels）。
+    def __init__(self, channels, n_heads=1, d_k=None):
+        super(AttentionBlock, self).__init__()
+
+        if d_k is None:
+            d_k = channels
+        self.norm = nn.GroupNorm(32, channels)
+        # 将输入特征映射到Q、K、V矩阵的组合，输出维度为n_heads * d_k * 3。
+        self.projection = nn.Linear(channels, n_heads * d_k * 3)
+        # 将注意力模块的结果合并回原始通道
+        self.output = nn.Linear(n_heads * d_k, channels)
+        # 用于缩放点积注意力得分，防止数值过大。
+        self.scale = d_k ** -0.5
+
+        self.n_heads = n_heads
+        self.d_k = d_k
+
+    # 可以忽略步长T
+    def forward(self, x):
+        # 将输入特征图从 (batch_size, channels, height, width) 转换为 (batch_size, height*width, channels)，使其适应序列处理形式
+        batch_size, n_channels, height, width = x.shape
+        # 通过投影层生成Q、K、V矩阵，并分割为三个部分
+        x = x.view(batch_size, n_channels, -1).permute(0, 2, 1)
+        qkv = self.projection(x).view(batch_size, -1, self.n_heads, 3 * self.d_k)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        # 使用点积计算相关性，缩放后应用Softmax归一化。
+        attn = torch.einsum('bihd,bjhd->bijh', q, k) * self.scale
+        attn = attn.softmax(dim=2)
+        # 将注意力权重与V矩阵相乘，得到加权聚合结果
+        res = torch.einsum('bijh,bjhd->bihd', attn, v)
+        res = res.view(batch_size, -1, self.n_heads * self.d_k)
+        # 拼接多头结果并通过线性层映射回原始通道数
+        res = self.output(res)
+        # 残差魅力时刻
+        res += x
+        # 将结果还原为图像格式 (batch_size, channels, height, width)
+        res = res.permute(0, 2, 1).view(batch_size, n_channels, height, width)
+        return res
+
+
+# DownBlock
+# 即Unet Encoder中每一层的核心处理逻辑，Encoder的每一层都有2个DownBlock
+class DownBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, time_channels: int, attention: bool):
+        super().__init__()
+
+        self.res = ResidualBlock(in_channels, out_channels, time_channels)
+        self.attention = nn.Identity()  # 不加注意力模块时直接空映射
+        if attention:
+            self.attention = AttentionBlock(out_channels)
+
+    def forward(self, x, t):
+        x=self.res(x, t)
+        x=self.attention(x)
+
+
+# UpBlock
+# 即Unet Decoder中每一层的核心处理逻辑，Decoder的每一层都有3个UpBlock
+class UpBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, time_channels: int, attention: bool):
+        super().__init__()
+
+        self.res = ResidualBlock(in_channels, out_channels, time_channels)
+        self.attention = nn.Identity()  # 不加注意力模块时直接空映射
+        if attention:
+            self.attention = AttentionBlock(out_channels)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
+        x = self.res(x, t)
+        x = self.attention(x)
+        return x
+
+
+# MiddleBlock
+# 包含2个残差块和1个注意力块，旨在提升网络在低分辨率下的表现能力（低分辨率层通常是网络的瓶颈，包含了高层次的语义信息，因此需要更强的模型表达能力）
+class MiddleBlock(nn.Module):
+    def __init__(self, n_channels: int, time_channels: int):
+        super().__init__()
+
+        self.res1 = ResidualBlock(n_channels, n_channels, time_channels)
+        self.attn = AttentionBlock(n_channels)
+        self.res2 = ResidualBlock(n_channels, n_channels, time_channels)
+
+    # 定义数据流动过程
+    def forward(self, x, t):
+        # x = self.middle_block(x, t)
+        x = self.res1(x, t)
+        x = self.attn(x)
+        x = self.res2(x, t)
+        return x
 
 # TimeEmbedding
 # 将步长T这个整数包装成维度为time_channel的向量 [(batch_size, time_channel)]
@@ -147,5 +247,132 @@ class TimeEmbedding(nn.Module):
         time_embedding=self.time_embedding(time_embedding)
         return time_embedding
 
+# 下采样
+# 通过步长为2的卷积操作，将输入特征图的空间尺寸（高度和宽度）减半，实现类似原Unet论文池化的效果
+class Downsample(nn.Module):
+    def __init__(self, n_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(3, 3), stride=(2, 2), padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
 
 
+# 上采样
+# 通过转置卷积（反卷积）操作，将输入特征图的空间尺寸扩大一倍，实现空间上采样。
+class Upsample(nn.Module):
+    def __init__(self, n_channels):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1))
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+# Unet
+# 默认图像为RGB3通道
+# 使用4层Decoder和Encoder，前2层无注意力，后2层注意力
+# 初始卷积层通道数64，其后分别为 128, 128, 256
+class Unet(nn.Module):
+    def __init__(self):
+        super(Unet, self).__init__()
+
+        # 获取步长向量
+        self.time_embedding = TimeEmbedding(256)
+
+        # 进入网络前先做一次初始卷积（使通道变为64）
+        self.pre_conv = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=(3, 3), padding=1)
+
+        # Encoder4层，从上往下走，前2层不加注意力，每层包含2个downblock残差块用于特征提取
+        self.encoder=nn.Sequential(
+            DownBlock(in_channels=64, out_channels=64, time_channels=256, attention=False),  # encoder1_downblock1
+            DownBlock(in_channels=64, out_channels=64, time_channels=256, attention=False),  # encoder1_downblock2
+            Downsample(n_channels=64),  # down_sample1
+            DownBlock(in_channels=64, out_channels=128, time_channels=256, attention=False),  # encoder2_downblock1
+            DownBlock(in_channels=128, out_channels=128, time_channels=256, attention=False),  # encoder2_downblock2
+            Downsample(n_channels=128),  # down_sample2
+            DownBlock(in_channels=128, out_channels=256, time_channels=256, attention=True),  # encoder3_downblock1
+            DownBlock(in_channels=256, out_channels=256, time_channels=256, attention=True),  # encoder3_downblock2
+            Downsample(n_channels=256),  # down_sample3
+            DownBlock(in_channels=256, out_channels=1024, time_channels=256, attention=True),  # encoder4_downblock1
+            DownBlock(in_channels=1024, out_channels=1024, time_channels=256, attention=True)  # encoder4_downblock2
+        )
+
+        # 瓶颈层 MiddleBlock
+        self.middle_block=MiddleBlock(n_channels=1024, time_channels=256)
+
+        # Decoder4层，从下往上走，后2层不加注意力，每层包含3个upblock残差块
+        # 看示意图，由于存在"Skip Connecting"结构，前面Encoder中相应层的结果会直接加过来输入，所以输入通道应是"和"的形式
+        self.decoder=nn.Sequential(
+            UpBlock(in_channels=1024 + 1024, out_channels=1024, time_channels=256, attention=True),  # decoder1_upblock1
+            UpBlock(in_channels=1024 + 1024, out_channels=1024, time_channels=256, attention=True),  # decoder1_upblock2
+            UpBlock(in_channels=1024 + 256, out_channels=256, time_channels=256, attention=True),  # decoder1_upblock3
+            Upsample(n_channels=256),  # up_sample1
+            UpBlock(in_channels=256 + 256, out_channels=256, time_channels=256, attention=True),  # decoder2_upblock1
+            UpBlock(in_channels=256 + 256, out_channels=256, time_channels=256, attention=True),  # decoder2_upblock2
+            UpBlock(in_channels=256 + 128, out_channels=128, time_channels=256, attention=True),  # decoder2_upblock3
+            Upsample(n_channels=128),  # up_sample2
+            UpBlock(in_channels=128 + 128, out_channels=128, time_channels=256, attention=False),  # decoder3_upblock1
+            UpBlock(in_channels=128 + 128, out_channels=128, time_channels=256, attention=False),  # decoder3_upblock2
+            UpBlock(in_channels=128 + 64, out_channels=64, time_channels=256, attention=False),  # decoder3_upblock3
+            Upsample(n_channels=64),  # up_sample3
+            UpBlock(in_channels=64 + 64, out_channels=64, time_channels=256, attention=False),  # decoder4_upblock1
+            UpBlock(in_channels=64 + 64, out_channels=64, time_channels=256, attention=False),  # decoder4_upblock2
+            UpBlock(in_channels=64 + 64, out_channels=64, time_channels=256, attention=False)  # decoder4_upblock3
+        )
+
+        # 最后一步还原为原输入图片的尺寸
+        self.final_conv=nn.Sequential(
+            nn.GroupNorm(num_groups=8, num_channels=64),
+            lambda x: x * torch.sigmoid(x),  # 即Swish()，一种平滑的非线性激活函数，增强非线性表达能力
+            nn.Conv2d(in_channels=64, out_channels=3, kernel_size=(3, 3), padding=1)
+        )
+
+
+    # 模型有2个输入：
+    # x：步长T下的图片数据
+    # t：步长T
+    def forward(self, x, t):
+        # -----------------------
+        # 预处理
+        # -----------------------
+        # 获取步长T的编码
+        t = self.time_embedding(t)
+        # 先把通道数卷到64再进入Encoder第一层
+        x = self.pre_conv(x)
+
+        # -----------------------
+        # Encoder
+        # -----------------------
+        # 记录每经过Encoder中每一个Block后的结果，方便Decoder阶段的组装
+        history = [x]
+        for step in self.encoder:
+            x= step(x, t)
+            history.append(x)
+
+        # -----------------------
+        # MiddleBlock
+        # -----------------------
+        x = self.middle_block(x, t)
+
+        # -----------------------
+        # Decoder
+        # -----------------------
+        for step in self.decoder:
+            # 若是上采样，直接做
+            # 若是残差块，需要和Encoder中的数据concat一下再输入
+            if isinstance(step, Upsample):
+                x = step(x, t)
+            else:
+                x = step(torch.cat((x, history.pop()), dim=1), t)
+
+        # -----------------------
+        # 最终输出
+        # -----------------------
+        x = self.final_conv(x)
+        return x
+
+
+# ----------------------------------------------------------------------
+# 4. 设置训练和验证方法、超参数
+# ----------------------------------------------------------------------
