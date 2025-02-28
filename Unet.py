@@ -1,61 +1,16 @@
-# ----------------------------------------------------------------------
-# 1. 数据处理流程
-# ----------------------------------------------------------------------
-from torchvision import transforms
-transform_train = transforms.Compose([
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(15),
-    transforms.RandomCrop(60, padding=4),
-    transforms.ToTensor(),
-    # transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-])
-
-
-#  ----------------------------------------------------------------------
-# 2. Dataset和DataLoader
-#  ----------------------------------------------------------------------
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-import os
-# 重定义PyTorch的Dataset类
-class MyAnimeDataset(Dataset):
-    def __init__(self, dataset_dir, transform=None):
-        self.dataset_dir = dataset_dir
-        self.transform = transform
-        self.images = [os.path.join(dataset_dir, file) for file in os.listdir(dataset_dir)]
-
-    # PyTorch 的 Dataset 类中__len__() 返回数据集的样本数量，通常通过 len(ds) 来调用
-    def __len__(self):
-        return len(self.images)
-
-    # __getitem__ 用于实现索引访问的特殊方法。隐式，使用索引访问对象如 obj[index]，Python 会自动调用 __getitem__
-    def __getitem__(self, idx):
-        img_name = os.path.join(self.dataset_dir, f"{idx}.png")
-        image = Image.open(img_name).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        return image
-
-# 创建自己的数据集实例
-train_dataset = MyAnimeDataset(
-    dataset_dir="./AnimeFaces64",
-    transform=transform_train
-)
-
-# 创建数据加载器
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=64,
-    shuffle=True,
-    num_workers=4
-)
-
-
-# ----------------------------------------------------------------------
-# 3. DDPM模型
-# ----------------------------------------------------------------------
 import torch.nn as nn
 import torch
+
+#Swish
+# 一种平滑的非线性激活函数，增强非线性表达能力
+class Swish(nn.Module):
+    def __init__(self):
+        super(Swish, self).__init__()
+
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
 # Residual
 # 残差块通过引入残差魅力时刻，避免深层网络中的梯度消失问题，提升了网络的训练效率和稳定性
 class ResidualBlock(nn.Module):
@@ -66,8 +21,7 @@ class ResidualBlock(nn.Module):
         # 处理步长T的向量维度，使之与Block1输出的图片数据结果相同，方便融合
         self.time_embedding=nn.Sequential(
             nn.Linear(time_channels, out_channels),
-            lambda x: x * torch.sigmoid(x),
-            lambda x: x[:, :, None, None]
+            Swish(),
         )
 
         # Residual 模块：两块block做特征提取、一块残差处理器将block的结果和原输入相加
@@ -81,14 +35,14 @@ class ResidualBlock(nn.Module):
             # 每次生成图像或其他高维数据时，可能会消耗大量内存，因此在训练时小batch_size降低内存压力
             # 往往关注样本的质量和多样性，因此小批次训练可以避免对大批次数据进行过多的平均化，使得模型能够更好地捕捉数据的细节
             nn.GroupNorm(32, in_channels),
-            lambda x: x * torch.sigmoid(x),     # 即Swish()，一种平滑的非线性激活函数，增强非线性表达能力
+            Swish(),
             nn.Conv2d(in_channels, out_channels, kernel_size=(3, 3), padding=1)
         )
 
         #第二块对图片步长形成的复合数据处理
         self.block2=nn.Sequential(
-            nn.GroupNorm(32, in_channels),
-            lambda x: x * torch.sigmoid(x),  # 即Swish()，一种平滑的非线性激活函数，增强非线性表达能力
+            nn.GroupNorm(32, out_channels),
+            Swish(),
             nn.Dropout(0.5),
             nn.Conv2d(out_channels, out_channels, kernel_size=(3, 3), padding=1)
         )
@@ -107,7 +61,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x, t):
         x2 = self.block1(x)
         # 处理步长T形成的time_embedding向量，通过线性层使time_c变为out_c，再和输入数据的特征图相加
-        x2 += self.time_embedding
+        x2 += self.time_embedding(t)[:, :, None, None]
         x2 = self.block2(x2)
         # 残差魅力时刻
         return x2 + self.shortcut(x)
@@ -177,6 +131,7 @@ class DownBlock(nn.Module):
     def forward(self, x, t):
         x=self.res(x, t)
         x=self.attention(x)
+        return x
 
 
 # UpBlock
@@ -220,13 +175,13 @@ class MiddleBlock(nn.Module):
 # （之后只需要再通过一个简单的线性层，将其维度从time_channel转变为对应特征图的out_channel，就能够和特征图相加）
 import math
 class TimeEmbedding(nn.Module):
-    def __init__(self, time_channels: int):
+    def __init__(self, time_channels):
         super().__init__()
         self.time_channels = time_channels
 
-        self.time_embedding = nn.Sequential(
+        self.time_embedding_layer = nn.Sequential(
             nn.Linear(self.time_channels // 4, self.time_channels),  # python中 / 返回浮点数，//才舍去小数
-            lambda x: x * torch.sigmoid(x),     # 即Swish()，一种平滑的非线性激活函数，增强非线性表达能力
+            Swish(),
             nn.Linear(self.time_channels, self.time_channels),
         )
 
@@ -244,7 +199,7 @@ class TimeEmbedding(nn.Module):
         C_embedding = t[:, None] * C_embedding[None, :]
         # 计算 emb 的正弦和余弦值，并将它们拼接（cat）在一起，形成一个包含正弦和余弦的时间编码
         time_embedding = torch.cat((C_embedding.sin(), C_embedding.cos()), dim=1)
-        time_embedding=self.time_embedding(time_embedding)
+        time_embedding = self.time_embedding_layer(time_embedding)
         return time_embedding
 
 # 下采样
@@ -254,7 +209,8 @@ class Downsample(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(3, 3), stride=(2, 2), padding=1)
 
-    def forward(self, x):
+    # 步长t此函数中无用，但为了放进后面的nn.Sequential内不会报错才加上
+    def forward(self, x, t):
         return self.conv(x)
 
 
@@ -265,7 +221,7 @@ class Upsample(nn.Module):
         super().__init__()
         self.conv = nn.ConvTranspose2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1))
 
-    def forward(self, x):
+    def forward(self, x, t):
         return self.conv(x)
 
 
@@ -324,7 +280,7 @@ class Unet(nn.Module):
         # 最后一步还原为原输入图片的尺寸
         self.final_conv=nn.Sequential(
             nn.GroupNorm(num_groups=8, num_channels=64),
-            lambda x: x * torch.sigmoid(x),  # 即Swish()，一种平滑的非线性激活函数，增强非线性表达能力
+            Swish(),
             nn.Conv2d(in_channels=64, out_channels=3, kernel_size=(3, 3), padding=1)
         )
 
@@ -347,7 +303,7 @@ class Unet(nn.Module):
         # 记录每经过Encoder中每一个Block后的结果，方便Decoder阶段的组装
         history = [x]
         for step in self.encoder:
-            x= step(x, t)
+            x = step(x, t)
             history.append(x)
 
         # -----------------------
@@ -371,8 +327,3 @@ class Unet(nn.Module):
         # -----------------------
         x = self.final_conv(x)
         return x
-
-
-# ----------------------------------------------------------------------
-# 4. 设置训练和验证方法、超参数
-# ----------------------------------------------------------------------
