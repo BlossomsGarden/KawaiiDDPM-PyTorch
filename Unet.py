@@ -4,24 +4,56 @@ import torch
 #Swish
 # 一种平滑的非线性激活函数，增强非线性表达能力
 class Swish(nn.Module):
-    def __init__(self):
-        super(Swish, self).__init__()
-
     def forward(self, x):
         return x * torch.sigmoid(x)
+
+
+# TimeEmbedding
+# 将步长T这个整数包装成维度为time_channel的向量 [(batch_size, time_channel)]
+# （这个包装方式和Transformer中函数式位置编码的包装方式一致）
+# （之后只需要再通过一个简单的线性层，将其维度从time_channel转变为对应特征图的out_channel，就能够和特征图相加）
+import math
+class TimeEmbedding(nn.Module):
+    def __init__(self, time_channels):
+        super().__init__()
+        self.time_channels = time_channels
+        self.base_channels = time_channels // 4
+
+        self.time_embedding_layer = nn.Sequential(
+            nn.Linear(self.base_channels, self.time_channels),  # python中 / 返回浮点数，//才舍去小数
+            Swish(),
+            nn.Linear(self.time_channels, self.time_channels),
+        )
+
+    def forward(self, t: torch.Tensor):
+        # 以下转换方法和Transformer的位置编码一致
+        half_dim = self.base_channels // 2
+        # C_embedding 是一个用于确定时间嵌入的缩放因子，它帮助计算不同频率的嵌入向量。
+        # 这个缩放因子是为生成时间步的频率信息（sin 和 cos）所需要的，控制着生成正弦和余弦频率时的细节。
+        # 该公式的设计基于 Transformer 中位置编码的理念。
+        # emb 控制了频率（即周期），使得时间编码能够捕捉到足够多的时间步信息，从而允许模型处理长时间序列和周期性的信息。
+        emb = math.log(10000) / half_dim
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -torch.tensor(emb, device=t.device))
+        # 将时间步长 t 与 C_embbing 进行广播操作（broadcasting）
+        # t[:, None] 会将 t 变成列向量，而 C_embbing[None, :] 将 C_embbing 转换为行向量。这样就能将每个时间步的 t 和每个频率值进行逐元素相乘，生成时间步的编码。
+        emb = t[:, None] * emb[None, :]
+        # 计算 emb 的正弦和余弦值，并将它们拼接（cat）在一起，形成一个包含正弦和余弦的时间编码
+        time_embedding = torch.cat((emb.sin(), emb.cos()), dim=1)
+        time_embedding = self.time_embedding_layer(time_embedding)
+        return time_embedding
 
 
 # Residual
 # 残差块通过引入残差魅力时刻，避免深层网络中的梯度消失问题，提升了网络的训练效率和稳定性
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_channels):
+    def __init__(self, in_channels: int, out_channels: int, time_channels: int, dropout: float = 0.1):
         super(ResidualBlock, self).__init__()
 
         # 步长编码器
         # 处理步长T的向量维度，使之与Block1输出的图片数据结果相同，方便融合
         self.time_embedding=nn.Sequential(
-            nn.Linear(time_channels, out_channels),
             Swish(),
+            nn.Linear(time_channels, out_channels),
         )
 
         # Residual 模块：两块block做特征提取、一块残差处理器将block的结果和原输入相加
@@ -43,7 +75,7 @@ class ResidualBlock(nn.Module):
         self.block2=nn.Sequential(
             nn.GroupNorm(32, out_channels),
             Swish(),
-            nn.Dropout(0.5),
+            nn.Dropout(dropout),
             nn.Conv2d(out_channels, out_channels, kernel_size=(3, 3), padding=1)
         )
 
@@ -58,7 +90,7 @@ class ResidualBlock(nn.Module):
     # 模型有2个输入：
     # x：步长T下的图片数据 [(batch_size, in_channels, height, width)]
     # t：步长T [(batch_size, time_channel)]
-    def forward(self, x, t):
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
         x2 = self.block1(x)
         # 处理步长T形成的time_embedding向量，通过线性层使time_c变为out_c，再和输入数据的特征图相加
         x2 += self.time_embedding(t)[:, :, None, None]
@@ -77,25 +109,25 @@ class ResidualBlock(nn.Module):
 class AttentionBlock(nn.Module):
     # channels：输入特征图的通道数
     # n_heads：注意力头的数量（默认为1）
-    # d_k：每个注意力头的向量维度（默认为n_channels）。
-    def __init__(self, channels, n_heads=1, d_k=None):
+    # d_k：每个注意力头的向量维度（默认为n_channels）
+    # num_groups：GroupNorm超参数
+    def __init__(self, channels: int, n_heads: int = 1, d_k:int = None, num_groups: int = 32):
         super(AttentionBlock, self).__init__()
 
         if d_k is None:
             d_k = channels
-        self.norm = nn.GroupNorm(32, channels)
+        self.norm = nn.GroupNorm(num_groups, channels)
         # 将输入特征映射到Q、K、V矩阵的组合，输出维度为n_heads * d_k * 3。
         self.projection = nn.Linear(channels, n_heads * d_k * 3)
         # 将注意力模块的结果合并回原始通道
         self.output = nn.Linear(n_heads * d_k, channels)
         # 用于缩放点积注意力得分，防止数值过大。
         self.scale = d_k ** -0.5
-
         self.n_heads = n_heads
         self.d_k = d_k
 
     # 可以忽略步长T
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         # 将输入特征图从 (batch_size, channels, height, width) 转换为 (batch_size, height*width, channels)，使其适应序列处理形式
         batch_size, n_channels, height, width = x.shape
         # 通过投影层生成Q、K、V矩阵，并分割为三个部分
@@ -122,13 +154,12 @@ class AttentionBlock(nn.Module):
 class DownBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, time_channels: int, attention: bool):
         super().__init__()
-
         self.res = ResidualBlock(in_channels, out_channels, time_channels)
         self.attention = nn.Identity()  # 不加注意力模块时直接空映射
         if attention:
             self.attention = AttentionBlock(out_channels)
 
-    def forward(self, x, t):
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
         x=self.res(x, t)
         x=self.attention(x)
         return x
@@ -162,55 +193,22 @@ class MiddleBlock(nn.Module):
         self.res2 = ResidualBlock(n_channels, n_channels, time_channels)
 
     # 定义数据流动过程
-    def forward(self, x, t):
-        # x = self.middle_block(x, t)
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
         x = self.res1(x, t)
         x = self.attn(x)
         x = self.res2(x, t)
         return x
 
-# TimeEmbedding
-# 将步长T这个整数包装成维度为time_channel的向量 [(batch_size, time_channel)]
-# （这个包装方式和Transformer中函数式位置编码的包装方式一致）
-# （之后只需要再通过一个简单的线性层，将其维度从time_channel转变为对应特征图的out_channel，就能够和特征图相加）
-import math
-class TimeEmbedding(nn.Module):
-    def __init__(self, time_channels):
-        super().__init__()
-        self.time_channels = time_channels
-
-        self.time_embedding_layer = nn.Sequential(
-            nn.Linear(self.time_channels // 4, self.time_channels),  # python中 / 返回浮点数，//才舍去小数
-            Swish(),
-            nn.Linear(self.time_channels, self.time_channels),
-        )
-
-    def forward(self, t: torch.Tensor):
-        # 以下转换方法和Transformer的位置编码一致
-        half_dim = self.time_channels // 8
-        # C_embedding 是一个用于确定时间嵌入的缩放因子，它帮助计算不同频率的嵌入向量。
-        # 这个缩放因子是为生成时间步的频率信息（sin 和 cos）所需要的，控制着生成正弦和余弦频率时的细节。
-        # 该公式的设计基于 Transformer 中位置编码的理念。
-        # emb 控制了频率（即周期），使得时间编码能够捕捉到足够多的时间步信息，从而允许模型处理长时间序列和周期性的信息。
-        C_embedding = math.log(10_000) / (half_dim - 1)
-        C_embedding = torch.exp(torch.arange(half_dim, device=t.device) * -torch.tensor(C_embedding, device=t.device))
-        # 将时间步长 t 与 C_embbing 进行广播操作（broadcasting）
-        # t[:, None] 会将 t 变成列向量，而 C_embbing[None, :] 将 C_embbing 转换为行向量。这样就能将每个时间步的 t 和每个频率值进行逐元素相乘，生成时间步的编码。
-        C_embedding = t[:, None] * C_embedding[None, :]
-        # 计算 emb 的正弦和余弦值，并将它们拼接（cat）在一起，形成一个包含正弦和余弦的时间编码
-        time_embedding = torch.cat((C_embedding.sin(), C_embedding.cos()), dim=1)
-        time_embedding = self.time_embedding_layer(time_embedding)
-        return time_embedding
 
 # 下采样
 # 通过步长为2的卷积操作，将输入特征图的空间尺寸（高度和宽度）减半，实现类似原Unet论文池化的效果
 class Downsample(nn.Module):
     def __init__(self, n_channels):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(3, 3), stride=(2, 2), padding=1)
+        self.conv = nn.Conv2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
 
     # 步长t此函数中无用，但为了放进后面的nn.Sequential内不会报错才加上
-    def forward(self, x, t):
+    def forward(self, x, t: torch.Tensor = None):
         return self.conv(x)
 
 
@@ -221,20 +219,20 @@ class Upsample(nn.Module):
         super().__init__()
         self.conv = nn.ConvTranspose2d(in_channels=n_channels, out_channels=n_channels, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1))
 
-    def forward(self, x, t):
+    def forward(self, x:torch.Tensor, t: torch.Tensor = None):
         return self.conv(x)
 
 
 # Unet
 # 默认图像为RGB3通道
 # 使用4层Decoder和Encoder，前2层无注意力，后2层注意力
-# 初始卷积层通道数64，其后分别为 128, 128, 256
+# 初始卷积层base_channels通道数64，其后分别为 128, 128, 256
 class Unet(nn.Module):
     def __init__(self):
         super(Unet, self).__init__()
 
-        # 获取步长向量
-        self.time_embedding = TimeEmbedding(256)
+        # 获取步长向量（先让它维数高一点，充分捕捉步长的复杂信息）
+        self.time_embedding = TimeEmbedding(64 *4)
 
         # 进入网络前先做一次初始卷积（使通道变为64）
         self.pre_conv = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=(3, 3), padding=1)
@@ -244,12 +242,15 @@ class Unet(nn.Module):
             DownBlock(in_channels=64, out_channels=64, time_channels=256, attention=False),  # encoder1_downblock1
             DownBlock(in_channels=64, out_channels=64, time_channels=256, attention=False),  # encoder1_downblock2
             Downsample(n_channels=64),  # down_sample1
+
             DownBlock(in_channels=64, out_channels=128, time_channels=256, attention=False),  # encoder2_downblock1
             DownBlock(in_channels=128, out_channels=128, time_channels=256, attention=False),  # encoder2_downblock2
             Downsample(n_channels=128),  # down_sample2
+
             DownBlock(in_channels=128, out_channels=256, time_channels=256, attention=True),  # encoder3_downblock1
             DownBlock(in_channels=256, out_channels=256, time_channels=256, attention=True),  # encoder3_downblock2
             Downsample(n_channels=256),  # down_sample3
+
             DownBlock(in_channels=256, out_channels=1024, time_channels=256, attention=True),  # encoder4_downblock1
             DownBlock(in_channels=1024, out_channels=1024, time_channels=256, attention=True)  # encoder4_downblock2
         )
@@ -264,14 +265,17 @@ class Unet(nn.Module):
             UpBlock(in_channels=1024 + 1024, out_channels=1024, time_channels=256, attention=True),  # decoder1_upblock2
             UpBlock(in_channels=1024 + 256, out_channels=256, time_channels=256, attention=True),  # decoder1_upblock3
             Upsample(n_channels=256),  # up_sample1
+
             UpBlock(in_channels=256 + 256, out_channels=256, time_channels=256, attention=True),  # decoder2_upblock1
             UpBlock(in_channels=256 + 256, out_channels=256, time_channels=256, attention=True),  # decoder2_upblock2
             UpBlock(in_channels=256 + 128, out_channels=128, time_channels=256, attention=True),  # decoder2_upblock3
             Upsample(n_channels=128),  # up_sample2
+
             UpBlock(in_channels=128 + 128, out_channels=128, time_channels=256, attention=False),  # decoder3_upblock1
             UpBlock(in_channels=128 + 128, out_channels=128, time_channels=256, attention=False),  # decoder3_upblock2
             UpBlock(in_channels=128 + 64, out_channels=64, time_channels=256, attention=False),  # decoder3_upblock3
             Upsample(n_channels=64),  # up_sample3
+
             UpBlock(in_channels=64 + 64, out_channels=64, time_channels=256, attention=False),  # decoder4_upblock1
             UpBlock(in_channels=64 + 64, out_channels=64, time_channels=256, attention=False),  # decoder4_upblock2
             UpBlock(in_channels=64 + 64, out_channels=64, time_channels=256, attention=False)  # decoder4_upblock3
@@ -315,12 +319,13 @@ class Unet(nn.Module):
         # Decoder
         # -----------------------
         for step in self.decoder:
-            # 若是上采样，直接做
-            # 若是残差块，需要和Encoder中的数据concat一下再输入
+            # 若是Upsample上采样，直接做
+            # 若是UpBlock残差块，需要和Encoder中的数据concat一下再输入
             if isinstance(step, Upsample):
                 x = step(x, t)
             else:
-                x = step(torch.cat((x, history.pop()), dim=1), t)
+                x = torch.cat((x, history.pop()), dim=1)
+                x = step(x, t)
 
         # -----------------------
         # 最终输出
